@@ -1,2 +1,7 @@
 *.csv
 .DS_Store
+.venv/
+*.md
+.claude/
+graphify-out/
+.graphifyignore
