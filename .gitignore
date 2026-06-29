@@ -5,3 +5,5 @@
 .claude/
 graphify-out/
 .graphifyignore
+*.pdf
+

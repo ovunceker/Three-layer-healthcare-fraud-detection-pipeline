@@ -1,0 +1,209 @@
+---
+title: "Healthcare Provider Fraud Detection"
+author: "Cotiviti Intern Assessment"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+In this document we will analyze the healthcare provider data. Main goal of this analysis is to create a logistic regression model
+to predict whether a provide is fradulent or not. In this analysis we will first identify the multicollinearity betweeen the features 
+we engineered using VIF. Later we will use ridge-logistic regression to create our model.
+
+```{r}
+X_train <- read.csv('X_train.csv')
+X_val <- read.csv('X_val.csv')
+X_test <- read.csv('X_test.csv')
+
+y_train <- read.csv('y_train.csv')
+y_val <- read.csv('y_val.csv')
+y_test <- read.csv('y_test.csv')
+```
+
+## Imputation
+
+NA values in features like `avg_length_of_stay` and `num_unique_procedure_codes` mean the provider had no inpatient claims or billed no procedures — so 0 is the correct fill, not the column mean.
+
+```{r}
+X_train[is.na(X_train)] <- 0
+X_val[is.na(X_val)]     <- 0
+X_test[is.na(X_test)]   <- 0
+```
+
+## Correlation Heatmap
+
+```{r, message=FALSE, warning=FALSE, fig.width=10, fig.height=10}
+library(ggplot2)
+
+X_num <- X_train[, sapply(X_train, is.numeric)]
+C <- cor(as.matrix(X_num))
+
+C_df      <- as.data.frame(as.table(C))
+names(C_df) <- c("Var1", "Var2", "value")
+C_df$high <- abs(C_df$value) > 0.95 &
+             as.character(C_df$Var1) != as.character(C_df$Var2)
+
+ggplot(C_df, aes(Var1, Var2, fill = value)) +
+  geom_tile() +
+  geom_point(data = C_df[C_df$high, ],
+             shape = 4, size = 2, color = "black") +
+  scale_fill_gradient2(low = "steelblue", mid = "white", high = "tomato",
+                       midpoint = 0, limits = c(-1, 1), name = "cor") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 6),
+        axis.text.y = element_text(size = 6)) +
+  labs(title = "Feature Correlation Matrix  (X = |cor| > 0.95)",
+       x = NULL, y = NULL)
+
+idx <- which(abs(C) > 0.95 & upper.tri(C), arr.ind = TRUE)
+if (nrow(idx) > 0) {
+  high_df <- data.frame(
+    Feature1    = rownames(C)[idx[, 1]],
+    Feature2    = colnames(C)[idx[, 2]],
+    Correlation = round(C[idx], 3)
+  )
+  knitr::kable(high_df, caption = "Feature pairs with |cor| > 0.95")
+}
+```
+
+## Multicollinearity Check (VIF Before Ridge)
+
+VIF values above 5 indicate problematic multicollinearity. We check this before
+applying ridge regression to motivate the use of regularization.
+
+```{r, message=FALSE, warning=FALSE}
+# compute VIF from correlation matrix — equivalent to regression-based VIF
+# but instant (no model fitting required)
+X_num <- X_train[, sapply(X_train, is.numeric)]
+C <- cor(as.matrix(X_num))
+vif_before <- diag(solve(C))
+names(vif_before) <- colnames(X_num)
+
+par(mar = c(9, 4, 4, 2))
+vif_sorted <- sort(vif_before, decreasing = TRUE)
+bp <- barplot(vif_sorted, names.arg = rep("", length(vif_sorted)),
+              main = "VIF Before Ridge Regression",
+              ylab = "VIF", col = ifelse(vif_sorted > 10, "tomato", "steelblue"))
+text(bp, par("usr")[3] - 0.3, labels = names(vif_sorted),
+     srt = 45, adj = 1, xpd = TRUE, cex = 0.55)
+abline(h = 10, col = "darkred", lty = 2)
+```
+
+## Ridge Logistic Regression
+
+```{r, message=FALSE, warning=FALSE}
+library(glmnet)
+library(pROC)
+
+# drop highly correlated columns before fitting
+drop_cols <- c("total_deductible_paid", "avg_deductible_paid",
+               "num_unique_attending_physicians", "num_unique_procedure_codes")
+
+keep_num <- function(df) {
+  df[, sapply(df, is.numeric) & !names(df) %in% drop_cols]
+}
+
+X_tr  <- as.matrix(keep_num(X_train))
+X_vl  <- as.matrix(keep_num(X_val))
+X_te  <- as.matrix(keep_num(X_test))
+
+train_means <- colMeans(X_tr)        # mean of each column (feature)
+train_sds   <- apply(X_tr, 2, sd)    # sd of each column (feature)
+
+X_tr_scaled <- scale(X_tr, center = train_means, scale = train_sds)
+X_vl_scaled <- scale(X_vl, center = train_means, scale = train_sds)
+X_te_scaled <- scale(X_te, center = train_means, scale = train_sds)
+
+fit <- glmnet(X_tr_scaled, as.numeric(y_train[[1]]),
+              family = "binomial", alpha = 0, lambda = NULL, standardize = FALSE)
+
+# predict on validation set for every lambda
+val_preds <- predict(fit, newx = X_vl_scaled, type = "response")
+# compute AUC for each lambda and pick the best
+aucs <- apply(val_preds, 2, function(p) auc(roc(as.numeric(y_val[[1]]), p, quiet = TRUE)))
+best_lambda <- fit$lambda[which.max(aucs)]
+
+cat("Best lambda:", best_lambda, "\nBest val AUC:", max(aucs), "\n")
+```
+
+## Multicollinearity Check (VIF After Ridge)
+
+```{r}
+X <- as.matrix(keep_num(X_train))
+r_xx  <- cor(X)
+c_val <- best_lambda
+
+VIF <- solve(r_xx + c_val * diag(1, nrow(r_xx))) %*%
+       r_xx %*%
+       solve(r_xx + c_val * diag(1, nrow(r_xx)))
+
+par(mar = c(9, 4, 4, 2))
+vif_vals <- sort(diag(VIF), decreasing = TRUE)
+bp4 <- barplot(vif_vals, names.arg = rep("", length(vif_vals)),
+               main = "VIF After Ridge",
+               ylab = "VIF",
+               col = ifelse(vif_vals > 10, "tomato", "steelblue"))
+text(bp4, par("usr")[3] - 0.3, labels = names(vif_vals),
+     srt = 45, adj = 1, xpd = TRUE, cex = 0.55)
+abline(h = 10, col = "darkred", lty = 2)
+```
+
+## Test Set Evaluation
+
+```{r}
+final_preds <- predict(fit, newx = X_te_scaled,
+                       type = "response", s = best_lambda)
+
+test_auc <- auc(roc(as.numeric(y_test[[1]]), as.numeric(final_preds), quiet = TRUE))
+cat("Test AUC:", test_auc, "\n")
+```
+
+## Visualizations
+
+**ROC curve** — shows the tradeoff between true positive rate and false positive rate on the test set.
+
+```{r}
+roc_obj <- roc(as.numeric(y_test[[1]]), as.numeric(final_preds), quiet = TRUE)
+plot(roc_obj, main = paste("ROC Curve (AUC =", round(test_auc, 3), ")"))
+```
+
+**Coefficient plot** — shows which features the model relies on most at the best lambda.
+
+```{r}
+coefs <- coef(fit, s = best_lambda)
+coef_df <- data.frame(
+  feature = rownames(coefs)[-1],
+  coef    = as.numeric(coefs)[-1]
+)
+coef_df <- coef_df[order(abs(coef_df$coef), decreasing = TRUE), ]
+coef_df <- head(coef_df, 15)
+
+par(mar = c(9, 4, 4, 2))
+bp3 <- barplot(coef_df$coef, names.arg = rep("", nrow(coef_df)),
+               main = "Top 15 Coefficients at Best Lambda",
+               ylab = "Coefficient",
+               col = ifelse(coef_df$coef > 0, "steelblue", "tomato"))
+text(bp3, par("usr")[3] - 0.003, labels = coef_df$feature,
+     srt = 45, adj = 1, xpd = TRUE, cex = 0.6)
+abline(h = 0)
+```
+
+**Predicted probability distribution by fraud label** — shows how well the model separates fraud from non-fraud.
+
+```{r}
+pred_df <- data.frame(
+  prob  = as.numeric(final_preds),
+  label = factor(as.numeric(y_test[[1]]), labels = c("Not Fraud", "Fraud"))
+)
+boxplot(prob ~ label, data = pred_df,
+        main = "Predicted Fraud Probability by True Label",
+        ylab = "Predicted Probability", col = c("steelblue", "tomato"))
+```
+
