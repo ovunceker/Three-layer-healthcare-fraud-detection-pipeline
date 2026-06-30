@@ -1,5 +1,5 @@
 ---
-title: "Healthcare Provider Fraud Detection"
+title: "Logistic Ridge Regression for Fraud Detection"
 author: "Cotiviti Intern Assessment"
 date: "`r Sys.Date()`"
 output:
