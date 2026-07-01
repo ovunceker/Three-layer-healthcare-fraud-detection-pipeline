@@ -1,0 +1,484 @@
+---
+title: "Time Series Analysis for Fraud Detection"
+author: "Ovunc Ozgun Eker"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Overview
+
+This document is the third layer of the fraud-detection pipeline. The first two layers
+(provider-level ridge logistic regression and claim-level z-score ensemble) operated on
+cross-sectional features. This layer asks a different question: **do fraudulent providers
+show unusual temporal billing patterns** — spikes, ramps, or irregularities in their
+month-by-month reimbursement totals that would not appear in clean providers?
+
+---
+
+## Stage 1 — Load and combine claims
+
+```{r load}
+library(tidyverse)
+library(lubridate)
+library(zoo)
+
+ip     <- read_csv("Train_IP.csv",  show_col_types = FALSE) |> mutate(claim_type = 1L)
+op     <- read_csv("Train_OP.csv",  show_col_types = FALSE) |> mutate(claim_type = 0L)
+labels <- read_csv("Train.csv",     show_col_types = FALSE)
+
+claims <- bind_rows(ip, op) |>
+  mutate(ClaimStartDt = ymd(ClaimStartDt))
+
+cat("Claims:", nrow(claims), "\n")
+cat("Date range:", format(min(claims$ClaimStartDt, na.rm = TRUE)),
+    "to", format(max(claims$ClaimStartDt, na.rm = TRUE)), "\n")
+```
+
+---
+
+## Stage 2 — Aggregate to provider x month
+
+```{r aggregate}
+monthly <- claims |>
+  mutate(month = floor_date(ClaimStartDt, "month")) |>
+  group_by(Provider, month) |>
+  summarise(
+    monthly_claim_count         = n(),
+    monthly_total_reimbursement = sum(InscClaimAmtReimbursed, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  left_join(labels |> select(Provider, PotentialFraud), by = "Provider")
+
+cat("Provider-month rows:", nrow(monthly), "\n")
+cat("Distinct providers:", n_distinct(monthly$Provider), "\n")
+```
+
+---
+
+## Stage 3 — Exploratory plot: fraud vs non-fraud temporal patterns
+
+We select providers with claims in at least 6 distinct months, then sample 8 fraud and
+8 non-fraud providers for a faceted line chart.
+
+```{r exploratory-plot, fig.width=12, fig.height=9}
+active_providers <- monthly |>
+  group_by(Provider) |>
+  filter(n() >= 6) |>
+  ungroup()
+
+set.seed(42)
+sample_fraud    <- active_providers |>
+  filter(PotentialFraud == "Yes") |> distinct(Provider) |> slice_sample(n = 8)
+sample_nonfraud <- active_providers |>
+  filter(PotentialFraud == "No")  |> distinct(Provider) |> slice_sample(n = 8)
+
+plot_data <- active_providers |>
+  filter(Provider %in% c(sample_fraud$Provider, sample_nonfraud$Provider)) |>
+  mutate(Label = ifelse(PotentialFraud == "Yes", "Fraud", "Non-fraud"))
+
+ggplot(plot_data,
+       aes(x = month, y = monthly_total_reimbursement / 1e3, colour = Label)) +
+  geom_line(linewidth = 0.7) + geom_point(size = 1.2) +
+  facet_wrap(~ Provider, scales = "free_y", ncol = 4) +
+  scale_colour_manual(values = c("Fraud" = "tomato", "Non-fraud" = "steelblue")) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title  = "Monthly Total Reimbursement: 8 Fraud vs 8 Non-Fraud Providers",
+       x = NULL, y = "Monthly reimbursement ($ thousands)", colour = NULL) +
+  theme_minimal(base_size = 9) +
+  theme(legend.position = "top",
+        strip.text  = element_text(size = 6),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 5))
+```
+
+---
+
+## Stage 4a — Spike detector: diagnostics on the original miscalibration
+
+The prior run flagged 72.9% of all providers — clearly too liberal. Before recalibrating,
+we look at *why*: what does the distribution of roll_z values and anomalous-month counts
+actually look like?
+
+```{r spike-diagnostics, fig.width=11, fig.height=4}
+# --- compute the raw z-scores (same lagged-baseline logic as before) ---
+compute_z <- function(df) {
+  x             <- df$monthly_total_reimbursement
+  baseline_mean <- lag(rollmeanr(x, k = 3, fill = NA), 1)
+  baseline_sd   <- lag(rollapply(x, width = 3, FUN = sd,
+                                 align = "right", fill = NA), 1)
+  roll_z <- ifelse(!is.na(baseline_sd) & baseline_sd > 0,
+                   (x - baseline_mean) / baseline_sd, NA_real_)
+  df |> mutate(roll_z = roll_z,
+               month_anomalous_z3 = !is.na(roll_z) & roll_z > 3)
+}
+
+monthly_z <- monthly |>
+  group_by(Provider) |> filter(n() >= 6) |>
+  arrange(month, .by_group = TRUE) |>
+  group_modify(~ compute_z(.x)) |>
+  ungroup()
+
+provider_counts <- monthly_z |>
+  group_by(Provider, PotentialFraud) |>
+  summarise(anomalous_months_z3 = sum(month_anomalous_z3, na.rm = TRUE),
+            .groups = "drop")
+
+par(mfrow = c(1, 3))
+
+# z-score distribution (cap display at 20 for readability)
+z_vals <- monthly_z$roll_z[!is.na(monthly_z$roll_z) &
+                            monthly_z$roll_z <= 20]
+hist(z_vals, breaks = 80, col = "steelblue", border = "white",
+     main = "Distribution of roll_z (capped at 20)",
+     xlab = "Rolling z-score", ylab = "Count")
+abline(v = 3, col = "tomato", lty = 2, lwd = 2)
+
+# anomalous-month count per provider
+hist(provider_counts$anomalous_months_z3, breaks = 30,
+     col = "steelblue", border = "white",
+     main = "Anomalous months per provider (z > 3)",
+     xlab = "Number of anomalous months", ylab = "Providers")
+
+# how flag rate changes with min_anomalous_months threshold
+thresh_seq <- 1:10
+flag_rates <- sapply(thresh_seq, function(k) {
+  mean(provider_counts$anomalous_months_z3 >= k)
+})
+plot(thresh_seq, flag_rates * 100, type = "b", pch = 16,
+     col = "steelblue", xlab = "Min anomalous months required",
+     ylab = "% providers flagged",
+     main = "Flag rate vs. min-months threshold")
+abline(h = c(5, 15), col = "tomato", lty = 2)
+legend("topright", legend = "5-15% target band",
+       col = "tomato", lty = 2, cex = 0.7)
+```
+
+---
+
+## Stage 4b — Recalibrated spike detector
+
+From the diagnostics above, we pick the minimum anomalous-month count that places the
+overall flag rate inside the 5-15% target band. This choice is based solely on
+"flags a sensible minority," not on what maximises the fraud ratio.
+
+```{r spike-recalibrated}
+# find the smallest threshold that brings flag rate to <= 15%
+min_months_threshold <- min(which(flag_rates <= 0.15))
+cat("Min anomalous months chosen:", min_months_threshold,
+    " -> flag rate:", round(flag_rates[min_months_threshold] * 100, 1), "%\n\n")
+
+provider_spike <- provider_counts |>
+  mutate(is_spike_anomalous =
+           anomalous_months_z3 >= min_months_threshold)
+
+spike_rates <- provider_spike |>
+  group_by(PotentialFraud) |>
+  summarise(n = n(), flagged = sum(is_spike_anomalous),
+            flag_rate = mean(is_spike_anomalous), .groups = "drop")
+print(spike_rates)
+
+spike_fraud    <- spike_rates |>
+  filter(PotentialFraud == "Yes") |> pull(flag_rate)
+spike_nonfraud <- spike_rates |>
+  filter(PotentialFraud == "No")  |> pull(flag_rate)
+cat("Fraud/non-fraud ratio:", round(spike_fraud / spike_nonfraud, 2), "x\n")
+
+ct_spike <- table(PotentialFraud    = provider_spike$PotentialFraud,
+                  Spike_Anomalous   = provider_spike$is_spike_anomalous)
+chi_spike <- chisq.test(ct_spike)
+cat("Chi-square:", round(chi_spike$statistic, 2),
+    " p-value:", format(chi_spike$p.value, digits = 3), "\n")
+```
+
+---
+
+## Stage 4c — Alternative framing: billing ramp (linear trend slope)
+
+The exploratory plot suggested that ramps or sustained level shifts might be more
+informative than single-month spikes. For each provider we fit a simple OLS line
+through their monthly reimbursement series (month index 1, 2, ... as x). The slope
+tells us whether billing is trending upward or downward over time.
+
+We flag providers whose standardised slope exceeds 2 standard deviations above the
+mean across all providers — i.e., unusually steep upward ramps.
+
+```{r ramp-detector}
+fit_slope <- function(df) {
+  df <- df |> arrange(month) |> mutate(t = row_number())
+  fit <- lm(monthly_total_reimbursement ~ t, data = df)
+  tibble(slope = coef(fit)[["t"]])
+}
+
+provider_slopes <- monthly |>
+  group_by(Provider, PotentialFraud) |>
+  filter(n() >= 6) |>
+  group_modify(~ fit_slope(.x)) |>
+  ungroup()
+
+# standardise slopes across all providers
+slope_mean <- mean(provider_slopes$slope, na.rm = TRUE)
+slope_sd   <- sd(provider_slopes$slope,   na.rm = TRUE)
+provider_slopes <- provider_slopes |>
+  mutate(slope_z          = (slope - slope_mean) / slope_sd,
+         is_ramp_anomalous = slope_z > 2)
+
+cat("Ramp-flagged providers:",
+    sum(provider_slopes$is_ramp_anomalous), "/",
+    nrow(provider_slopes),
+    sprintf("(%.1f%%)\n\n", mean(provider_slopes$is_ramp_anomalous) * 100))
+
+ramp_rates <- provider_slopes |>
+  group_by(PotentialFraud) |>
+  summarise(n = n(), flagged = sum(is_ramp_anomalous),
+            flag_rate = mean(is_ramp_anomalous), .groups = "drop")
+print(ramp_rates)
+
+ramp_fraud    <- ramp_rates |>
+  filter(PotentialFraud == "Yes") |> pull(flag_rate)
+ramp_nonfraud <- ramp_rates |>
+  filter(PotentialFraud == "No")  |> pull(flag_rate)
+cat("Fraud/non-fraud ratio:", round(ramp_fraud / ramp_nonfraud, 2), "x\n")
+
+ct_ramp <- table(PotentialFraud  = provider_slopes$PotentialFraud,
+                 Ramp_Anomalous  = provider_slopes$is_ramp_anomalous)
+chi_ramp <- chisq.test(ct_ramp)
+cat("Chi-square:", round(chi_ramp$statistic, 2),
+    " p-value:", format(chi_ramp$p.value, digits = 3), "\n")
+```
+
+---
+
+## Stage 5 — Robustness Check 1: scale invariance
+
+The raw-dollar ramp signal (7x ratio) could be a size artifact: large-billing providers
+happen to be fraudulent AND have steeper absolute slopes simply because their numbers are
+bigger. Two scale-invariant alternatives test whether the pattern survives normalisation.
+
+### 5a — Log-scale ramp (OLS on log1p)
+
+```{r ramp-log}
+fit_slope_log <- function(df) {
+  df <- df |> arrange(month) |> mutate(t = row_number())
+  fit <- lm(log1p(monthly_total_reimbursement) ~ t, data = df)
+  tibble(slope_log = coef(fit)[["t"]])
+}
+
+provider_slopes_log <- monthly |>
+  group_by(Provider, PotentialFraud) |>
+  filter(n() >= 6) |>
+  group_modify(~ fit_slope_log(.x)) |>
+  ungroup()
+
+slope_log_mean <- mean(provider_slopes_log$slope_log, na.rm = TRUE)
+slope_log_sd   <- sd(provider_slopes_log$slope_log,   na.rm = TRUE)
+provider_slopes_log <- provider_slopes_log |>
+  mutate(slope_log_z        = (slope_log - slope_log_mean) / slope_log_sd,
+         is_log_ramp_anomalous = slope_log_z > 2)
+
+cat("Log-ramp flagged:", sum(provider_slopes_log$is_log_ramp_anomalous), "/",
+    nrow(provider_slopes_log),
+    sprintf("(%.1f%%)\n\n", mean(provider_slopes_log$is_log_ramp_anomalous) * 100))
+
+log_rates <- provider_slopes_log |>
+  group_by(PotentialFraud) |>
+  summarise(n = n(), flagged = sum(is_log_ramp_anomalous),
+            flag_rate = mean(is_log_ramp_anomalous), .groups = "drop")
+print(log_rates)
+
+log_fraud    <- log_rates |> filter(PotentialFraud == "Yes") |> pull(flag_rate)
+log_nonfraud <- log_rates |> filter(PotentialFraud == "No")  |> pull(flag_rate)
+cat("Fraud/non-fraud ratio:", round(log_fraud / log_nonfraud, 2), "x\n")
+
+ct_log  <- table(PotentialFraud    = provider_slopes_log$PotentialFraud,
+                 Log_Ramp_Anomalous = provider_slopes_log$is_log_ramp_anomalous)
+chi_log <- chisq.test(ct_log)
+cat("Chi-square:", round(chi_log$statistic, 2),
+    " p-value:", format(chi_log$p.value, digits = 3), "\n")
+```
+
+---
+
+### 5b — Mean-normalised ramp
+
+```{r ramp-meannorm}
+fit_slope_norm <- function(df) {
+  df <- df |> arrange(month) |> mutate(t = row_number())
+  m  <- mean(df$monthly_total_reimbursement, na.rm = TRUE)
+  # divide by provider mean so slope is in units of "fraction of mean per month"
+  df <- df |> mutate(y_norm = monthly_total_reimbursement / pmax(m, 1))
+  fit <- lm(y_norm ~ t, data = df)
+  tibble(slope_norm = coef(fit)[["t"]])
+}
+
+provider_slopes_norm <- monthly |>
+  group_by(Provider, PotentialFraud) |>
+  filter(n() >= 6) |>
+  group_modify(~ fit_slope_norm(.x)) |>
+  ungroup()
+
+slope_norm_mean <- mean(provider_slopes_norm$slope_norm, na.rm = TRUE)
+slope_norm_sd   <- sd(provider_slopes_norm$slope_norm,   na.rm = TRUE)
+provider_slopes_norm <- provider_slopes_norm |>
+  mutate(slope_norm_z         = (slope_norm - slope_norm_mean) / slope_norm_sd,
+         is_norm_ramp_anomalous = slope_norm_z > 2)
+
+cat("Norm-ramp flagged:", sum(provider_slopes_norm$is_norm_ramp_anomalous), "/",
+    nrow(provider_slopes_norm),
+    sprintf("(%.1f%%)\n\n", mean(provider_slopes_norm$is_norm_ramp_anomalous) * 100))
+
+norm_rates <- provider_slopes_norm |>
+  group_by(PotentialFraud) |>
+  summarise(n = n(), flagged = sum(is_norm_ramp_anomalous),
+            flag_rate = mean(is_norm_ramp_anomalous), .groups = "drop")
+print(norm_rates)
+
+norm_fraud    <- norm_rates |> filter(PotentialFraud == "Yes") |> pull(flag_rate)
+norm_nonfraud <- norm_rates |> filter(PotentialFraud == "No")  |> pull(flag_rate)
+cat("Fraud/non-fraud ratio:", round(norm_fraud / norm_nonfraud, 2), "x\n")
+
+ct_norm  <- table(PotentialFraud      = provider_slopes_norm$PotentialFraud,
+                  Norm_Ramp_Anomalous  = provider_slopes_norm$is_norm_ramp_anomalous)
+chi_norm <- chisq.test(ct_norm)
+cat("Chi-square:", round(chi_norm$statistic, 2),
+    " p-value:", format(chi_norm$p.value, digits = 3), "\n")
+```
+
+---
+
+## Stage 6 — Robustness Check 2: window-edge artifact
+
+The data spans 2008-01 through 2009-12. The first and last months may be partial (billing
+not yet fully submitted or adjudicated), which could inflate the apparent ramp by creating
+an artificial low start or high finish. We restrict to 2008-12 through 2009-11 — 12
+complete interior months — and re-run the best ramp version.
+
+```{r ramp-edgetrim}
+monthly_trim <- monthly |>
+  filter(month >= as.Date("2008-12-01"),
+         month <= as.Date("2009-11-01"))
+
+cat("Trimmed provider-month rows:", nrow(monthly_trim), "\n")
+cat("Date range:", format(min(monthly_trim$month)), "to",
+    format(max(monthly_trim$month)), "\n\n")
+
+# determine best version from Check 1 (higher ratio wins)
+best_ratio_check1 <- max(log_fraud / log_nonfraud,
+                         norm_fraud / norm_nonfraud)
+
+if ((log_fraud / log_nonfraud) >= (norm_fraud / norm_nonfraud)) {
+  cat("Best Check-1 method: log-scale ramp\n\n")
+  fit_best <- fit_slope_log
+  slope_col <- "slope_log"
+} else {
+  cat("Best Check-1 method: mean-normalised ramp\n\n")
+  fit_best <- fit_slope_norm
+  slope_col <- "slope_norm"
+}
+
+provider_slopes_trim <- monthly_trim |>
+  group_by(Provider, PotentialFraud) |>
+  filter(n() >= 6) |>
+  group_modify(~ fit_best(.x)) |>
+  ungroup()
+
+slope_trim_vals <- provider_slopes_trim[[slope_col]]
+slope_trim_mean <- mean(slope_trim_vals, na.rm = TRUE)
+slope_trim_sd   <- sd(slope_trim_vals,   na.rm = TRUE)
+provider_slopes_trim <- provider_slopes_trim |>
+  mutate(slope_trim_z        = (slope_trim_vals - slope_trim_mean) / slope_trim_sd,
+         is_trim_ramp_anomalous = slope_trim_z > 2)
+
+cat("Edge-trimmed ramp flagged:", sum(provider_slopes_trim$is_trim_ramp_anomalous), "/",
+    nrow(provider_slopes_trim),
+    sprintf("(%.1f%%)\n\n", mean(provider_slopes_trim$is_trim_ramp_anomalous) * 100))
+
+trim_rates <- provider_slopes_trim |>
+  group_by(PotentialFraud) |>
+  summarise(n = n(), flagged = sum(is_trim_ramp_anomalous),
+            flag_rate = mean(is_trim_ramp_anomalous), .groups = "drop")
+print(trim_rates)
+
+trim_fraud    <- trim_rates |> filter(PotentialFraud == "Yes") |> pull(flag_rate)
+trim_nonfraud <- trim_rates |> filter(PotentialFraud == "No")  |> pull(flag_rate)
+cat("Fraud/non-fraud ratio:", round(trim_fraud / trim_nonfraud, 2), "x\n")
+
+ct_trim  <- table(PotentialFraud      = provider_slopes_trim$PotentialFraud,
+                  Trim_Ramp_Anomalous  = provider_slopes_trim$is_trim_ramp_anomalous)
+chi_trim <- chisq.test(ct_trim)
+cat("Chi-square:", round(chi_trim$statistic, 2),
+    " p-value:", format(chi_trim$p.value, digits = 3), "\n")
+```
+
+---
+
+## Stage 7 — Full comparison table
+
+```{r summary-table}
+# original spike (z>3, any month) — recompute rate from provider_counts
+orig_rates <- provider_counts |>
+  group_by(PotentialFraud) |>
+  summarise(flag_rate = mean(anomalous_months_z3 >= 1), .groups = "drop")
+orig_fraud    <- orig_rates |> filter(PotentialFraud == "Yes") |> pull(flag_rate)
+orig_nonfraud <- orig_rates |> filter(PotentialFraud == "No")  |> pull(flag_rate)
+ct_orig  <- table(PotentialFraud = provider_counts$PotentialFraud,
+                  Flag = provider_counts$anomalous_months_z3 >= 1)
+chi_orig <- chisq.test(ct_orig)
+
+summary_tbl <- tibble(
+  Method = c(
+    "Original spike (z>3, >=1 month)",
+    paste0("Recalibrated spike (z>3, >=", min_months_threshold, " months)"),
+    "Ramp — raw dollars (OLS slope z>2)",
+    "Ramp — log1p scale",
+    "Ramp — mean-normalised",
+    paste0("Ramp — edge-trimmed (best of log/norm, 2008-12 to 2009-11)")
+  ),
+  `Overall flag %` = c(
+    sprintf("%.1f%%", mean(provider_counts$anomalous_months_z3 >= 1) * 100),
+    sprintf("%.1f%%", flag_rates[min_months_threshold] * 100),
+    sprintf("%.1f%%", mean(provider_slopes$is_ramp_anomalous) * 100),
+    sprintf("%.1f%%", mean(provider_slopes_log$is_log_ramp_anomalous) * 100),
+    sprintf("%.1f%%", mean(provider_slopes_norm$is_norm_ramp_anomalous) * 100),
+    sprintf("%.1f%%", mean(provider_slopes_trim$is_trim_ramp_anomalous) * 100)
+  ),
+  `Fraud flag %` = c(
+    sprintf("%.1f%%", orig_fraud * 100),
+    sprintf("%.1f%%", spike_fraud * 100),
+    sprintf("%.1f%%", ramp_fraud * 100),
+    sprintf("%.1f%%", log_fraud * 100),
+    sprintf("%.1f%%", norm_fraud * 100),
+    sprintf("%.1f%%", trim_fraud * 100)
+  ),
+  `Non-fraud flag %` = c(
+    sprintf("%.1f%%", orig_nonfraud * 100),
+    sprintf("%.1f%%", spike_nonfraud * 100),
+    sprintf("%.1f%%", ramp_nonfraud * 100),
+    sprintf("%.1f%%", log_nonfraud * 100),
+    sprintf("%.1f%%", norm_nonfraud * 100),
+    sprintf("%.1f%%", trim_nonfraud * 100)
+  ),
+  `Fraud/NF ratio` = c(
+    round(orig_fraud / orig_nonfraud, 2),
+    round(spike_fraud / spike_nonfraud, 2),
+    round(ramp_fraud / ramp_nonfraud, 2),
+    round(log_fraud / log_nonfraud, 2),
+    round(norm_fraud / norm_nonfraud, 2),
+    round(trim_fraud / trim_nonfraud, 2)
+  ),
+  `p-value` = c(
+    format(chi_orig$p.value, digits = 3),
+    format(chi_spike$p.value, digits = 3),
+    format(chi_ramp$p.value, digits = 3),
+    format(chi_log$p.value, digits = 3),
+    format(chi_norm$p.value, digits = 3),
+    format(chi_trim$p.value, digits = 3)
+  )
+)
+
+knitr::kable(summary_tbl, caption = "Temporal detector comparison — all methods")
+```

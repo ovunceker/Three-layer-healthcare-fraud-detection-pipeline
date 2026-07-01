@@ -1,6 +1,6 @@
 ---
 title: "Logistic Ridge Regression for Fraud Detection"
-author: "Cotiviti Intern Assessment"
+author: "Ovunc Ozgun Eker"
 date: "`r Sys.Date()`"
 output:
   pdf_document:
