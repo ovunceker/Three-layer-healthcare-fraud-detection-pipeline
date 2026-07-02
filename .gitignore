@@ -6,4 +6,4 @@
 graphify-out/
 .graphifyignore
 *.pdf
-
+~$*
